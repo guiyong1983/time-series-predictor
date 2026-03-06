@@ -47,13 +47,163 @@ except ImportError:
     LGBM_AVAILABLE = False
 
 import streamlit as st
+from dataclasses import dataclass
+from typing import Optional, Dict, Tuple
 
 # ==========================================
-# 1. 核心功能函数
+# 1. 数据模型
+# ==========================================
+
+@dataclass
+class IndexConfig:
+    """训练集和测试集索引配置"""
+    train_start: int
+    train_end: int
+    total_length: int
+
+    @property
+    def train_length(self) -> int:
+        """训练集长度"""
+        return self.train_end - self.train_start
+
+    @property
+    def test_length(self) -> int:
+        """测试集长度"""
+        return self.total_length - self.train_end
+
+    @property
+    def test_start(self) -> int:
+        """测试集起始索引"""
+        return self.train_end
+
+    @property
+    def test_end(self) -> int:
+        """测试集结束索引"""
+        return self.total_length
+
+
+@dataclass
+class ValidationResult:
+    """索引验证结果"""
+    is_valid: bool
+    error_message: Optional[str] = None
+    warning_message: Optional[str] = None
+
+
+@dataclass
+class DatasetSplit:
+    """数据集划分结果"""
+    train_series: pd.Series
+    test_series: pd.Series
+    full_series: pd.Series
+    config: IndexConfig
+
+
+def validate_index_config(
+    train_start: int,
+    train_end: int,
+    total_length: int,
+    min_train_length: int = 10,
+    min_test_length: int = 1
+) -> ValidationResult:
+    """
+    验证索引配置的合法性
+
+    Args:
+        train_start: 训练集起始索引
+        train_end: 训练集结束索引
+        total_length: 数据总长度
+        min_train_length: 最小训练集长度，默认10
+        min_test_length: 最小测试集长度，默认1
+
+    Returns:
+        ValidationResult: 验证结果对象
+    """
+    # 检查起始索引是否为负数
+    if train_start < 0:
+        return ValidationResult(
+            is_valid=False,
+            error_message="起始索引不能为负数"
+        )
+
+    # 检查结束索引是否超出数据范围
+    if train_end > total_length:
+        return ValidationResult(
+            is_valid=False,
+            error_message=f"结束索引超出数据范围（最大允许值：{total_length}）"
+        )
+
+    # 检查结束索引是否大于起始索引
+    if train_end <= train_start:
+        return ValidationResult(
+            is_valid=False,
+            error_message="结束索引必须大于起始索引"
+        )
+
+    # 检查训练集长度是否足够
+    train_length = train_end - train_start
+    if train_length < min_train_length:
+        return ValidationResult(
+            is_valid=False,
+            error_message=f"训练集长度不足（当前：{train_length}，最小要求：{min_train_length}）"
+        )
+
+    # 检查测试集长度是否足够
+    test_length = total_length - train_end
+    if test_length < min_test_length:
+        return ValidationResult(
+            is_valid=False,
+            error_message=f"测试集长度不足（当前：{test_length}，最小要求：{min_test_length}）"
+        )
+
+    # 所有检查通过
+    return ValidationResult(is_valid=True)
+
+
+def calculate_constraints(
+    total_length: int,
+    current_train_start: Optional[int] = None,
+    current_train_end: Optional[int] = None,
+    min_train_length: int = 10,
+    min_test_length: int = 1
+) -> Dict[str, Tuple[int, int]]:
+    """
+    计算输入控件的约束范围
+
+    Args:
+        total_length: 数据总长度
+        current_train_start: 当前训练集起始索引（可选）
+        current_train_end: 当前训练集结束索引（可选）
+        min_train_length: 最小训练集长度，默认10
+        min_test_length: 最小测试集长度，默认1
+
+    Returns:
+        Dict[str, Tuple[int, int]]: 包含train_start和train_end约束的字典
+    """
+    # 计算train_start的约束
+    train_start_min = 0
+    train_start_max = total_length - min_train_length - min_test_length
+
+    # 计算train_end的约束
+    if current_train_start is not None:
+        train_end_min = max(current_train_start + min_train_length, min_train_length)
+    else:
+        train_end_min = min_train_length
+
+    train_end_max = total_length - min_test_length
+
+    return {
+        'train_start': (train_start_min, train_start_max),
+        'train_end': (train_end_min, train_end_max)
+    }
+
+
+# ==========================================
+# 2. 核心功能函数
 # ==========================================
 
 def load_data(file):
-    """加载数据并提取数值列"""
+    """加载数据并返回DataFrame和数值列信息"""
     if file.name.endswith('.csv'):
         df = pd.read_csv(file)
     elif file.name.endswith(('.xlsx', '.xls')):
@@ -75,9 +225,42 @@ def load_data(file):
     if len(numeric_cols) == 0:
         raise ValueError("文件中未找到数值列")
     
-    # 取第一个数值列
-    data_series = df[numeric_cols[0]].dropna().reset_index(drop=True)
-    return data_series
+    return df, numeric_cols
+
+
+def split_dataset(
+    data_series: pd.Series,
+    config: IndexConfig
+) -> DatasetSplit:
+    """
+    根据索引配置划分数据集
+
+    Args:
+        data_series: 完整的数据序列
+        config: 索引配置对象
+
+    Returns:
+        DatasetSplit: 数据集划分结果
+
+    Raises:
+        IndexError: 当索引超出数据范围时抛出
+    """
+    # 验证索引范围
+    if config.train_start < 0 or config.train_end > config.total_length:
+        raise IndexError("索引超出数据范围")
+
+    # 切片数据
+    train_series = data_series.iloc[config.train_start:config.train_end].reset_index(drop=True)
+    test_series = data_series.iloc[config.train_end:].reset_index(drop=True)
+    full_series = data_series.iloc[config.train_start:config.train_end + config.test_length].reset_index(drop=True)
+
+    return DatasetSplit(
+        train_series=train_series,
+        test_series=test_series,
+        full_series=full_series,
+        config=config
+    )
+
 
 def detect_outliers(series, method='zscore', threshold=3):
     """异常值检测"""
@@ -474,6 +657,7 @@ st.title("📊 高级时间序列预测平台")
 st.markdown("""
 **功能特点：**
 - 📂 **本地上传**：支持 CSV, Excel, TXT。
+- 🔢 **多列支持**：支持多列数据文件，可选择任意数值列进行预测。
 - 🎚️ **完全自由**：训练集可从任意位置截取，长度可设为任意正整数。
 - 🤖 **多模型融合**：XGBoost, LSTM, Prophet, ARIMA, LightGBM。
 - 📉 **智能适配**：自动根据数据量调整模型参数。
@@ -486,11 +670,34 @@ uploaded_file = st.file_uploader("1. 上传数据文件", type=['csv', 'xlsx', '
 
 if uploaded_file:
     try:
-        data_series = load_data(uploaded_file)
+        df, numeric_cols = load_data(uploaded_file)
+        
+        # 显示数据预览
+        with st.expander("📋 查看数据预览"):
+            st.dataframe(df.head(20))
+            st.write(f"数据形状: {df.shape}")
+            st.write(f"数值列: {list(numeric_cols)}")
+        
+        # 列选择功能
+        if len(numeric_cols) > 1:
+            st.subheader("🔢 选择数据列")
+            selected_col = st.selectbox(
+                "选择要用于预测的数值列",
+                options=numeric_cols,
+                help="从文件的多个数值列中选择一列进行时间序列预测"
+            )
+            st.info(f"已选择列: **{selected_col}**")
+        else:
+            selected_col = numeric_cols[0]
+            st.info(f"文件中只有一个数值列: **{selected_col}**")
+        
+        # 提取选择的数据列
+        data_series = df[selected_col].dropna().reset_index(drop=True)
         total_len = len(data_series)
         st.success(f"✅ 数据加载成功！共 **{total_len}** 条记录。")
         
         # 异常值检测
+        st.divider()
         outlier_method = st.selectbox("选择异常值检测方法", ["无", "Z-Score", "IQR"])
         if outlier_method != "无":
             outliers = detect_outliers(data_series, method=outlier_method.lower())
@@ -504,59 +711,55 @@ if uploaded_file:
             else:
                 st.info("✅ 未检测到异常值")
         
-        # 显示前几行
-        with st.expander("查看数据预览"):
-            st.dataframe(data_series.head())
-            st.line_chart(data_series)
-
+        # 显示选择列的数据图表
+        st.divider()
+        st.subheader("📈 数据可视化")
+        st.line_chart(data_series)
+        
         st.divider()
         st.subheader("2. 参数设置")
-        
+
         col1, col2, col3, col4 = st.columns(4)
-        
+
         with col1:
-            # 训练集起始位置
-            train_start_max = total_len - 10  # 至少保留10个点用于测试和预测
+            # 训练集起始索引
+            constraints = calculate_constraints(total_len)
             train_start = st.number_input(
-                "训练集起始位置", 
-                min_value=0, 
-                max_value=train_start_max,
+                "训练集起始索引",
+                min_value=constraints['train_start'][0],
+                max_value=constraints['train_start'][1],
                 value=0,
                 step=1,
                 help="训练集从哪个索引位置开始（从0开始计数）"
             )
-        
+
         with col2:
-            # 训练集长度
-            max_train_length = total_len - train_start - 10  # 预留空间
-            default_train_length = min(3300, max_train_length) if max_train_length > 3300 else max_train_length
-            
-            train_length = st.number_input(
-                "训练集长度", 
-                min_value=10, 
-                max_value=max_train_length, 
-                value=int(default_train_length), 
+            # 训练集结束索引
+            constraints = calculate_constraints(total_len, current_train_start=train_start)
+            default_train_end = min(total_len - 119, total_len - 1) if total_len > 120 else total_len - 1
+            train_end = st.number_input(
+                "训练集结束索引",
+                min_value=constraints['train_end'][0],
+                max_value=constraints['train_end'][1],
+                value=int(default_train_end),
                 step=1,
-                help="训练集的长度"
+                help="训练集在哪个索引位置结束（不包含该位置）"
             )
-        
+
         with col3:
-            # 测试集长度
-            test_start = train_start + train_length
-            max_test_length = total_len - test_start - 1
-            if max_test_length < 1:
-                st.error("参数设置不当，没有剩余空间给测试集！")
-                max_test_length = 1
-            
-            default_test_length = min(119, max_test_length) if max_test_length >= 119 else max_test_length
-            
-            test_length = st.number_input(
-                "测试集长度", 
-                min_value=1, 
-                max_value=max_test_length, 
-                value=int(default_test_length), 
-                step=1
-            )
+            # 验证索引配置
+            validation_result = validate_index_config(train_start, train_end, total_len)
+
+            if validation_result.is_valid:
+                train_length = train_end - train_start
+                test_length = total_len - train_end
+                st.success(f"✅ 配置有效")
+                st.info(f"""
+                - 训练集: [{train_start}:{train_end-1}] (长度: {train_length})
+                - 测试集: [{train_end}:{total_len-1}] (长度: {test_length})
+                """)
+            else:
+                st.error(f"❌ {validation_result.error_message}")
 
         with col4:
             # 选择要运行的模型
@@ -580,35 +783,37 @@ if uploaded_file:
             )
 
         # 计算关键参数
-        train_end = train_start + train_length
-        test_end = test_start + test_length
-        target_index = test_end  # 预测目标点的索引
-        
-        # 验证参数有效性
-        if train_end > total_len or test_end > total_len:
-            st.error("❌ 参数设置超出数据范围，请调整参数！")
-        elif train_length < 10:
-            st.error("❌ 训练集长度至少需要10个点！")
-        elif test_length < 1:
-            st.error("❌ 测试集长度至少需要1个点！")
-        else:
-            remaining = total_len - target_index - 1
-            st.info(f"""💡 **配置确认**:
-- 训练集: [{train_start}:{train_end-1}] (长度: {train_length})
-- 测试集: [{test_start}:{test_end-1}] (长度: {test_length})
-- **预测目标**: 第 {target_index+1} 个数据 (索引 {target_index})
-- 剩余缓冲数据: {max(0, remaining)} 条""")
-            
+        test_start = train_end  # 测试集从训练集结束位置开始
+        test_end = total_len  # 测试集到数据末尾
+        target_index = total_len - 1  # 预测目标点的索引（最后一个数据点）
+
+        # 验证索引配置
+        validation_result = validate_index_config(train_start, train_end, total_len)
+
+        if validation_result.is_valid:
             # 交叉验证选项
             do_cv = st.checkbox("执行交叉验证 (耗时较长)", value=False)
             
             if st.button("🚀 开始运行多模型预测"):
-                # 截取数据
-                train_series = data_series.iloc[train_start:train_end]
-                test_series = data_series.iloc[test_start:test_end]
-                # 构建用于特征工程的完整历史数据（从训练集开始到测试集结束）
-                full_series = data_series.iloc[train_start:test_end]
-                
+                # 验证索引配置
+                validation_result = validate_index_config(train_start, train_end, total_len)
+                if not validation_result.is_valid:
+                    st.error(f"❌ {validation_result.error_message}")
+                    st.stop()
+
+                # 创建索引配置对象
+                config = IndexConfig(
+                    train_start=train_start,
+                    train_end=train_end,
+                    total_length=total_len
+                )
+
+                # 划分数据集
+                dataset_split = split_dataset(data_series, config)
+                train_series = dataset_split.train_series
+                test_series = dataset_split.test_series
+                full_series = dataset_split.full_series
+
                 results = {}
                 y_true = test_series.values
                 
@@ -737,12 +942,12 @@ if uploaded_file:
                            color='lightgray', alpha=0.5, linewidth=1, label='完整数据')
                     
                     # 绘制训练集
-                    ax.plot(range(train_start, train_end), train_series.values, 
+                    ax.plot(range(train_start, train_end), train_series.values,
                            color='blue', linewidth=2, alpha=0.7, label=f'训练集 [{train_start}:{train_end-1}]')
-                    
+
                     # 绘制测试集真实值
                     test_x_axis = range(test_start, test_start + len(y_true_final))
-                    ax.plot(test_x_axis, y_true_final, 
+                    ax.plot(test_x_axis, y_true_final,
                            label='真实值 (测试集)', color='black', linewidth=2, marker='o', markersize=4)
                     
                     colors = {
@@ -767,10 +972,9 @@ if uploaded_file:
                     
                     # 标记分割线
                     ax.axvline(x=train_start, color='gray', linestyle=':', alpha=0.7, label='训练集开始')
-                    ax.axvline(x=train_end, color='gray', linestyle='-.', alpha=0.7, label='训练集结束')
-                    ax.axvline(x=test_start, color='gray', linestyle='--', alpha=0.7, label='测试集开始')
-                    ax.axvline(x=test_end, color='gray', linestyle='--', alpha=0.7, label='测试集结束')
-                    
+                    ax.axvline(x=train_end, color='gray', linestyle='-.', alpha=0.7, label='训练集结束/测试集开始')
+                    ax.axvline(x=test_end, color='gray', linestyle='--', alpha=0.7, label='数据结束')
+
                     ax.set_title(f'多模型融合预测 - 目标：第 {target_index+1} 个数据')
                     ax.set_xlabel('时间步索引')
                     ax.set_ylabel('数值')
@@ -782,8 +986,9 @@ if uploaded_file:
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     config = {
                         'train_start': train_start,
-                        'train_length': train_length,
-                        'test_length': test_length,
+                        'train_end': train_end,
+                        'train_length': train_end - train_start,
+                        'test_length': test_end - train_end,
                         'selected_models': selected_models,
                         'do_cross_validation': do_cv
                     }
